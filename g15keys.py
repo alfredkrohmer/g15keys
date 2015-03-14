@@ -14,10 +14,13 @@ import sys
 import time
 import collections
 import traceback
+import threading
 
 from Xlib import X
 from Xlib.display import Display
 from Xlib.ext.xtest import fake_input
+from Xlib.ext import record
+from Xlib.protocol import rq 
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -113,10 +116,8 @@ G15_KEYS_L = (
 G15_KEY_LIGHT = 1<<27
 
 
-
 class DaemonConnection:
     def __init__(self):
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._disconnecting = False
 
     def _recv(self, length):
@@ -125,6 +126,8 @@ class DaemonConnection:
         while received < length:
             try:
                 d = self._socket.recv(length - received)
+                if len(d) == 0:
+                    return None
             except InterruptedError:
                 continue
             except OSError:
@@ -136,12 +139,26 @@ class DaemonConnection:
             data += d
         return data
 
+    def reconnect(self):
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        while True:
+            try:
+                self._socket.connect(("localhost", 15550))
+            except socket.error as e:
+                msg = os.strerror(e.errno)
+                log.error("Could not connect to daemon: %s. Will try again in 10 seconds.", msg)
+            else:
+                gr = self._recv(16)
+                if gr != b"G15 daemon HELLO":
+                    log.error("Wrong daemon greeting: %s. Will try again in 10 seconds.", gr)
+                else:
+                    break
+            time.sleep(10)
+        self._socket.send(self._screen_type)
+
     def connect(self, screen_type = G15_PIXELBUF):
-        self._socket.connect(("localhost", 15550))
-        if self._recv(16) != b"G15 daemon HELLO":
-            log.error("Wrong daemon greeting!")
-            sys.exit(3)
-        self._socket.send(screen_type)
+        self._screen_type = screen_type
+        self.reconnect()
 
     def disconnect(self):
         self._disconnecting = True
@@ -156,36 +173,68 @@ class DaemonConnection:
                 assert(0 <= val <= 1<<2)
             packet |= val
         log.debug("Sending packet (1 byte) to daemon: %s", str(packet))
-        self._socket.send(bytes([packet]))
+        if self._socket.send(bytes([packet])) is None:
+            return None
         if cmd == G15DAEMON_GET_KEYSTATE:
-            return struct.unpack("I", self._recv(4))[0]
+            ret = self._recv(4)
+            if ret is None:
+                return None
+            return struct.unpack("I", ret)[0]
         elif cmd in (G15DAEMON_IS_FOREGROUND, G15DAEMON_IS_USER_SELECTED):
-            return struct.unpack("H", self._recv(2))[0] - 48
+            ret = self._recv(2)
+            if ret is None:
+                return None
+            return struct.unpack("H", ret)[0] - 48
+        return 0
 
     def waitkey(self):
-        return struct.unpack("I", self._recv(4))[0]
+        ret = self._recv(4)
+        if ret is None:
+            return None
+        return struct.unpack("I", ret)[0]
+
 
 class G15KeysClient:
-    def __init__(self):
+    def __init__(self, connect_signals = True):
         self._keys = 0
         self._profile = ''
         self._recording = False
         self._exiting = False
+        self._display = None
+        self._display_record = None
         if not self._load():
             return
         self._dc = DaemonConnection()
         self._dc.connect(G15_G15RBUF)
-        self._dc.cmd(G15DAEMON_KEY_HANDLER)
-        self._dc.cmd(G15DAEMON_MKEYLEDS, 1<<2)
-        for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGPIPE):
-            signal.signal(s, self._exit)
-        signal.signal(signal.SIGUSR1, self._load)
+        self._reconnect(True)
+        if connect_signals:
+            for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGPIPE):
+                signal.signal(s, self._exit)
+            signal.signal(signal.SIGUSR1, self._load)
         while True:
             try:
-                self._handle(self._dc.waitkey())
+                key = self._dc.waitkey()
+                if key is None:
+                    self._reconnect()
+                    continue
+                self._handle(key)
             except Exception:
                 traceback.print_exc()
-            self._dc.waitkey()
+            if self._dc.waitkey() is None:
+                self._reconnect()
+
+    def _reconnect(self, first = False):
+        while True:
+            if not first:
+                log.error("Lost connection to daemon.")
+                time.sleep(1)
+                self._dc.reconnect()
+            if self._dc.cmd(G15DAEMON_KEY_HANDLER) is None or self._dc.cmd(G15DAEMON_MKEYLEDS, 1<<2) is None:
+                first = False
+                continue
+            if not first:
+                log.info("Reconnected.")
+            return
 
     def _exit(self, signum = 0, frame = 0):
         log.info("Graceful shutdown")
@@ -236,10 +285,7 @@ class G15KeysClient:
         log.debug("%s button %s", key, "pressed" if pressed else "released")
         if self._recording:
             if not pressed:
-                log.debug("Finished recording, saving macro: %s", str(self._record))
-                self._recording = False
-                self._conf[self._profile][key] = "emit " + ",".join(self._record)
-                self._save()
+                self._stop_recording(key)
         else:
             c = self._conf[self._profile].get(key)
             if isinstance(c, dict):
@@ -269,7 +315,7 @@ class G15KeysClient:
         elif cmd.startswith("emit "):
             self._emit(cmd[5:])
         elif cmd == "record":
-            self._record()
+            self._start_recording()
         else:
             FNULL = open(os.devnull, 'w')
             subprocess.Popen(shlex.split(cmd), stdout=FNULL, stderr=FNULL, preexec_fn=os.setpgrp)
@@ -284,11 +330,14 @@ class G15KeysClient:
     def _set_leds(self, leds):
         log.debug("Setting LED state")
         for led in leds.split(','):
-            self._dc.cmd(G15DAEMON_MKEYLEDS, 2**(int(led[1])-1))
+            if self._dc.cmd(G15DAEMON_MKEYLEDS, 2**(int(led[1])-1)) is None:
+                self._reconnect()
+                return
 
     def _emit(self, keys):
+        if self._display is None:
+            self._display = Display()
         log.debug("Emitting key presses")
-        d = Display()
         for key in keys.split(','):
             mouse = key[0] == 'm'
             press = key[1] == '+'
@@ -297,13 +346,51 @@ class G15KeysClient:
                 ev = X.ButtonPress if press else X.ButtonRelease
             else:
                 ev = X.KeyPress if press else X.KeyRelease
-            fake_input(d, ev, num)
-        d.sync()
+            fake_input(self._display, ev, num)
+        self._display.sync()
 
-    def _record(self):
+    def _start_recording(self):
+        if self._display is None:
+            self._display = Display()
+            self._display_record = Display()
         log.debug("Started recording macro")
         self._recording = True
         self._record = []
+        self._record_ctx = self._display_record.record_create_context(0, [record.AllClients], [{
+            'core_requests': (0, 0),
+            'core_replies': (0, 0),
+            'ext_requests': (0, 0, 0, 0),
+            'ext_replies': (0, 0, 0, 0),
+            'delivered_events': (0, 0),
+            'device_events': (X.KeyPress, X.KeyRelease),
+            'errors': (0, 0),
+            'client_started': False,
+            'client_died': False
+        }])
+        thread = threading.Thread(target = self._display_record.record_enable_context, args=(self._record_ctx, self._record_key))
+        thread.start()
+
+    def _stop_recording(self, key):
+        self._display.record_disable_context(self._record_ctx)
+        self._display.record_free_context(self._record_ctx)
+        self._display.flush()
+
+        log.debug("Finished recording, saving macro: %s", str(self._record))
+        self._recording = False
+        self._conf[self._profile][key] = "emit " + ",".join(self._record)
+        self._save()
+
+    def _record_key(self, reply):
+        log.debug("Received X event")
+        if reply.category != record.FromServer or reply.client_swapped or not len(reply.data) or reply.data[0] < 2:
+            return
+
+        data = reply.data
+        while len(data):
+            event, data = rq.EventField(None).parse_binary_value(data, self._display_record.display, None, None)
+            if event.type in [X.KeyPress, X.KeyRelease]:
+                log.debug("Detected key: %d", event.detail)
+                self._record.append("k" + (event.type == X.KeyPress and "+" or "-") + str(event.detail))
 
 if __name__ == "__main__":
     def usage():
@@ -313,15 +400,16 @@ if __name__ == "__main__":
     except getopt.GetoptError:
         usage()
         sys.exit(2)
+    debug = False
     for opt, arg in opts:
-        print(opt)
         if opt in ("-h", "--help"):
             usage()
             sys.exit()
         if opt in ("-d", "--debug"):
-            logging.basicConfig(level=logging.DEBUG)
+            debug = True
+            log.setLevel(logging.DEBUG)
         if opt in ("-b", "--background"):
             if os.fork() > 0:
                 sys.exit(0)
-    G15KeysClient()
+    G15KeysClient(not debug)
 

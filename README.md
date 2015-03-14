@@ -27,13 +27,11 @@ For emitting fake input: key presses are done with `k+<keycode>`, key releases w
 The following is currently implemented:
 * reacting upon key pressed and / or released
 * executing programs or scripts
-* emitting a series of key presses / releases (macro playback)
+* capturing and emitting a series of key presses / releases (macro recording and playback)
 * multiple profiles that can be switched by certain G-keys
 
 Still outstanding:
-* automatic reconnect to g15daemon
 * GUI tool for easier configuration
-* macro recording
 * automatic profile activation depending on certain conditions
 * key tap repetition
 
