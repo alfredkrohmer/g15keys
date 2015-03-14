@@ -24,6 +24,8 @@ To start a program or a script, the full path, starting with `/` needs to be pro
 
 For emitting fake input: key presses are done with `k+<keycode>`, key releases with `k-<keycode>`; mouse buttons can be pressed and released with `m+<keycode>` / `m-<keycode>`. The required keycodes can be obtained by running `xev`.
 
+For macro recording, assign the action `"record"` to some key (e.g. MR) and press it. Enter the macro you want to record and press a G-key or M-key to save the macro to this key.
+
 The following is currently implemented:
 * reacting upon key pressed and / or released
 * executing programs or scripts
