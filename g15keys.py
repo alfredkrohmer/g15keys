@@ -345,6 +345,10 @@ class G15KeysClient:
             if mouse:
                 ev = X.ButtonPress if press else X.ButtonRelease
             else:
+                if key[0] == 's':
+                    self._display.sync()
+                    time.sleep(num/1000)
+                    continue
                 ev = X.KeyPress if press else X.KeyRelease
             fake_input(self._display, ev, num)
         self._display.sync()
@@ -352,6 +356,7 @@ class G15KeysClient:
     def _start_recording(self):
         if self._display is None:
             self._display = Display()
+        if self._display_record is None:
             self._display_record = Display()
         log.debug("Started recording macro")
         self._recording = True
