@@ -376,10 +376,10 @@ class G15KeysClient:
 
     def _set_leds(self, leds):
         log.debug("Setting LED state")
-        leds = 0
+        state = 0
         for led in leds.split(','):
-            leds |= 2**(int(led[1])-1)
-        self._dc.cmd(G15DAEMON_MKEYLEDS, leds)
+            state |= 2**(int(led[1])-1)
+        self._dc.cmd(G15DAEMON_MKEYLEDS, state)
 
     def _emit(self, keys):
         if self._display is None:
