@@ -17,6 +17,7 @@ import traceback
 import threading
 
 from Xlib import X
+from Xlib.keysymdef import xf86
 from Xlib.display import Display
 from Xlib.ext.xtest import fake_input
 from Xlib.ext import record
@@ -38,6 +39,7 @@ G15DAEMON_GET_KEYSTATE = 0x6b
 G15DAEMON_SWITCH_PRIORITIES = 0x70
 G15DAEMON_IS_FOREGROUND = 0x76
 G15DAEMON_IS_USER_SELECTED = 0x75
+G15DAEMON_NEVER_SELECT = 0x6e
 
 G15_KEY_G1  = 1<<0
 G15_KEY_G2  = 1<<1
@@ -121,11 +123,10 @@ class DaemonConnection:
         self._disconnecting = False
 
     def _recv(self, length):
-        received = 0
         data = b""
-        while received < length:
+        while len(data) < length:
             try:
-                d = self._socket.recv(length - received)
+                d = self._socket.recv(length - len(data))
                 if len(d) == 0:
                     return None
             except InterruptedError:
@@ -135,12 +136,13 @@ class DaemonConnection:
                     raise
                 else:
                     sys.exit()
-            received += len(d)
             data += d
         return data
 
     def reconnect(self):
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_OOBINLINE, 1)
+
         while True:
             try:
                 self._socket.connect(("localhost", 15550))
@@ -154,7 +156,9 @@ class DaemonConnection:
                 else:
                     break
             time.sleep(10)
+
         self._socket.send(self._screen_type)
+        self._socket.send(bytes([0]*6880)) # sending an empty screen
 
     def connect(self, screen_type = G15_PIXELBUF):
         self._screen_type = screen_type
@@ -172,26 +176,31 @@ class DaemonConnection:
             else:
                 assert(0 <= val <= 1<<2)
             packet |= val
+
         log.debug("Sending packet (1 byte) to daemon: %s", str(packet))
-        if self._socket.send(bytes([packet])) is None:
-            return None
+
+        # control messages are sent with the Out-Of-Band (OOB) flag;
+        # messages without this flag are considered screen content for the LCD
+        self._socket.sendall(bytes([packet]), socket.MSG_OOB)
+
         if cmd == G15DAEMON_GET_KEYSTATE:
             ret = self._recv(4)
             if ret is None:
                 return None
             return struct.unpack("I", ret)[0]
         elif cmd in (G15DAEMON_IS_FOREGROUND, G15DAEMON_IS_USER_SELECTED):
-            ret = self._recv(2)
+            ret = self._recv(1)
             if ret is None:
                 return None
-            return struct.unpack("H", ret)[0] - 48
+            return struct.unpack("B", ret)[0]
+
         return 0
 
     def waitkey(self):
-        ret = self._recv(4)
+        ret = self._recv(8)
         if ret is None:
             return None
-        return struct.unpack("I", ret)[0]
+        return struct.unpack("I", ret[0:4])[0]
 
 
 class G15KeysClient:
@@ -205,8 +214,7 @@ class G15KeysClient:
         if not self._load():
             return
         self._dc = DaemonConnection()
-        self._dc.connect(G15_G15RBUF)
-        self._reconnect(True)
+        self._reconnect(G15_G15RBUF)
         if connect_signals:
             for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGPIPE):
                 signal.signal(s, self._exit)
@@ -220,21 +228,25 @@ class G15KeysClient:
                 self._handle(key)
             except Exception:
                 traceback.print_exc()
-            if self._dc.waitkey() is None:
-                self._reconnect()
 
-    def _reconnect(self, first = False):
+    def _reconnect(self, screen_type = None):
         while True:
-            if not first:
+            if screen_type is None:
                 log.error("Lost connection to daemon.")
                 time.sleep(1)
                 self._dc.reconnect()
-            if self._dc.cmd(G15DAEMON_KEY_HANDLER) is None or self._dc.cmd(G15DAEMON_MKEYLEDS, 1<<2) is None:
-                first = False
-                continue
-            if not first:
-                log.info("Reconnected.")
-            return
+            else:
+                self._dc.connect(screen_type)
+            screen_type = None
+
+            self._dc.cmd(G15DAEMON_MKEYLEDS, 1<<0)
+            self._dc.cmd(G15DAEMON_SWITCH_PRIORITIES)
+            self._dc.cmd(G15DAEMON_NEVER_SELECT)
+            self._dc.cmd(G15DAEMON_KEY_HANDLER)
+
+            break
+
+        log.info("Connected to g15daemon.")
 
     def _exit(self, signum = 0, frame = 0):
         log.info("Graceful shutdown")
@@ -244,13 +256,17 @@ class G15KeysClient:
 
     def _load(self, signum = 0, frame = 0):
         log.info("Loading configuration")
+
         with open(os.path.join(os.environ['HOME'], ".g15keys", "config")) as f:
             conf = json.load(f, object_pairs_hook=collections.OrderedDict)
+
         if not conf.keys:
             log.error("No profile found")
             return False
+
         if self._profile not in conf.keys():
             self._profile = next(iter(conf.keys()))
+
         self._conf = conf
         return True
 
@@ -259,30 +275,57 @@ class G15KeysClient:
             json.dump(self._conf, f, sort_keys=True, indent=4)
     
     def _handle(self, keys):
+        log.debug("Received keycode from g15daemon: %d", keys)
+
         changed = self._keys ^ keys
         pressed = self._keys
         self._keys = keys
-        p = pressed < keys
-        for g in G15_KEYS_G:
-            if changed & g:
-                key = int(math.log2(g)) + 1
-                if key > 18:
-                    key -= 10
-                self._key("G" + str(key), p)
-        for m in G15_KEYS_M:
-            if changed & m:
-                key = int(math.log2(m)) - 17
-                if 1 <= key <= 3:
-                    self._key("M" + str(key), p)
-                else:
-                    self._key("MR", p)
-        for l in G15_KEYS_L:
-            if changed & l:
-                key = int(math.log2(l)) - 21
-                self._key("L" + str(key), p)    
+
+        p = pressed < keys # true if the last event was a "press" event
+
+        if keys & G15_KEY_LIGHT:
+            # the protocol is a bit strange here:
+            # if the multimedia keys are being pressed, bit 27 (for the light button) is 1
+            if changed & G15_KEY_G1:
+                keycode = 162 # audio play
+            if changed & G15_KEY_G2:
+                keycode = 164 # audio stop
+            if changed & G15_KEY_G3:
+                keycode = 144 # previous
+            if changed & G15_KEY_G4:
+                keycode = 153 # next
+            if changed & G15_KEY_G5:
+                keycode = 121 # mute
+            if changed & G15_KEY_G6:
+                keycode = 123 # raise volume
+            if changed & G15_KEY_G7:
+                keycode = 122 # lower volume
+            keycode = str(keycode)
+            if p:
+                self._emit("k+" + keycode + ",s+10,k-" + keycode)
+        else:
+            # the key number is extracted from the keycode by finding the bit position that is 1 -> log2
+            for g in G15_KEYS_G:
+                if changed & g:
+                    key = int(math.log2(g)) + 1
+                    if key > 18:
+                        key -= 10
+                    self._key("G" + str(key), p)
+            for m in G15_KEYS_M:
+                if changed & m:
+                    key = int(math.log2(m)) - 17
+                    if 1 <= key <= 3:
+                        self._key("M" + str(key), p)
+                    else:
+                        self._key("MR", p)
+            for l in G15_KEYS_L:
+                if changed & l:
+                    key = int(math.log2(l)) - 21
+                    self._key("L" + str(key), p)
 
     def _key(self, key, pressed):
         log.debug("%s button %s", key, "pressed" if pressed else "released")
+
         if self._recording:
             if not pressed:
                 self._stop_recording(key)
@@ -299,15 +342,19 @@ class G15KeysClient:
                 pass
             else:
                 c = None
+
             if c is not None:
                 self._do(c)
 
     def _do(self, cmd):
-        log.debug("Executing the following command: %s", cmd)
+        log.debug("Executing the following command: %s", str(cmd))
+
         if isinstance(cmd, list):
             for c in cmd:
                 self._do(c)
             return
+
+        # simple parser; could be done better?!
         if cmd.startswith("switch-profile "):
             self._switch_profile(cmd[15:])
         elif cmd.startswith("set-leds "):
@@ -316,7 +363,7 @@ class G15KeysClient:
             self._emit(cmd[5:])
         elif cmd == "record":
             self._start_recording()
-        else:
+        elif cmd.startswith("/"):
             FNULL = open(os.devnull, 'w')
             subprocess.Popen(shlex.split(cmd), stdout=FNULL, stderr=FNULL, preexec_fn=os.setpgrp)
 
@@ -329,10 +376,10 @@ class G15KeysClient:
 
     def _set_leds(self, leds):
         log.debug("Setting LED state")
+        leds = 0
         for led in leds.split(','):
-            if self._dc.cmd(G15DAEMON_MKEYLEDS, 2**(int(led[1])-1)) is None:
-                self._reconnect()
-                return
+            leds |= 2**(int(led[1])-1)
+        self._dc.cmd(G15DAEMON_MKEYLEDS, leds)
 
     def _emit(self, keys):
         if self._display is None:
@@ -358,9 +405,12 @@ class G15KeysClient:
             self._display = Display()
         if self._display_record is None:
             self._display_record = Display()
+
         log.debug("Started recording macro")
+
         self._recording = True
         self._record = []
+
         self._record_ctx = self._display_record.record_create_context(0, [record.AllClients], [{
             'core_requests': (0, 0),
             'core_replies': (0, 0),
@@ -372,6 +422,7 @@ class G15KeysClient:
             'client_started': False,
             'client_died': False
         }])
+
         thread = threading.Thread(target = self._display_record.record_enable_context, args=(self._record_ctx, self._record_key))
         thread.start()
 
